@@ -5,6 +5,10 @@ app_description = "Agentic AI Assistant for Frappe and ERPNext"
 app_email = "info@paralogic.io"
 app_license = "mit"
 
+ai_assistant_tool_modules = [
+	"ai_assistant.capabilities.tools.search",
+]
+
 # Apps
 # ------------------
 
