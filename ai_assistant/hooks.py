@@ -5,9 +5,12 @@ app_description = "Agentic AI Assistant for Frappe and ERPNext"
 app_email = "info@paralogic.io"
 app_license = "mit"
 
-ai_assistant_tool_modules = [
-	"ai_assistant.capabilities.tools.search",
+# Modules whose `@tool` functions the AI Assistant offers its model. Any app can
+# list its own here to give the assistant tools.
+ai_assistant_tools = [
+	"ai_assistant.tools.doctypes",
 ]
+
 
 # Apps
 # ------------------
@@ -250,4 +253,3 @@ ai_assistant_tool_modules = [
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
-
