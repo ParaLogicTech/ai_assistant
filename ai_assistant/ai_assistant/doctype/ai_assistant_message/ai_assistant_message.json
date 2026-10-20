@@ -11,7 +11,9 @@
   "model",
   "request_id",
   "content",
-  "error"
+  "error",
+  "form",
+  "form_response"
  ],
  "fields": [
   {
@@ -37,7 +39,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Status",
-   "options": "Completed\nCancelled\nFailed"
+   "options": "Completed\nPaused\nCancelled\nFailed"
   },
   {
    "fieldname": "model",
@@ -60,11 +62,23 @@
    "fieldname": "error",
    "fieldtype": "JSON",
    "label": "Error"
+  },
+  {
+   "description": "The question the turn paused on, where it stopped to ask the user.",
+   "fieldname": "form",
+   "fieldtype": "JSON",
+   "label": "Form"
+  },
+  {
+   "description": "What became of the question: the values given, or that it was declined, passed over or expired.",
+   "fieldname": "form_response",
+   "fieldtype": "JSON",
+   "label": "Form Response"
   }
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-10-06 12:00:00.000000",
+ "modified": "2026-10-20 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "AI Assistant",
  "name": "AI Assistant Message",

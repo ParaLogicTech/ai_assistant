@@ -42,7 +42,14 @@
 					<div v-else-if="!messages.length" class="welcome">
 						<h2>{{ __("How can I help you today?") }}</h2>
 					</div>
-					<ChatMessage v-for="message in messages" :key="message.name" :message="message" :models="models" />
+					<ChatMessage
+						v-for="message in messages"
+						:key="message.name"
+						:message="message"
+						:models="models"
+						:busy="Boolean(running)"
+						@reply="(reply) => respond(message, reply)"
+					/>
 				</div>
 			</div>
 
@@ -52,6 +59,7 @@
 						ref="composer"
 						:streaming="isStreamingHere"
 						:busy="Boolean(running) && !isStreamingHere"
+						:placeholder="waitingForm ? __('Answer the question above, or send a message to skip it') : ''"
 						@send="send"
 						@stop="stop"
 					/>
@@ -89,6 +97,9 @@ const composer = ref(null);
 let following = true;
 
 const isStreamingHere = computed(() => Boolean(running.value) && running.value.runId === activeThread.value);
+
+// A form the thread is waiting on: sending a message passes it over.
+const waitingForm = computed(() => messages.value.some((message) => message.status === "Paused"));
 
 const activeTitle = computed(() => threads.value.find((thread) => thread.name === activeThread.value)?.title || "");
 
@@ -152,25 +163,14 @@ async function send(text) {
 
 	try {
 		await api.stream({ content: text, context: { run_id: runId, request_id: requestId, model } }, (event) => {
-			if (event.name === "text_delta") {
-				reply.content += event.data.text;
-				scrollToBottom();
-			} else if (event.name === "tool_started") {
-				reply.tools.push({ ...event.data, status: "running" });
-				scrollToBottom();
-			} else if (event.name === "tool_ended") {
-				const call = reply.tools.find((tool) => tool.id === event.data.id);
-				if (call) {
-					call.status = event.data.failed ? "failed" : "done";
-				}
-			} else if (event.name === "outcome") {
-				settle(reply, event.data);
+			if (event.name === "form_dismissed") {
+				settleForms({ dismissed: true });
+			} else {
+				follow(reply, event);
 			}
 		});
 
-		if (reply.streaming) {
-			settle(reply, { type: "error", error: { type: "internal", detail: __("The connection was lost.") } });
-		}
+		lost(reply);
 	} catch (error) {
 		settle(reply, { type: "error", error: { type: "internal", detail: error.message } });
 	} finally {
@@ -179,12 +179,127 @@ async function send(text) {
 	}
 }
 
+/**
+ * Answers or declines the form `message` paused on, and follows the turn it resumes.
+ *
+ * The reply's own answer appears once the run resumes: a form handed back to fix, or
+ * one no longer waiting, resumes nothing and stays where it is.
+ */
+async function respond(message, reply) {
+	if (running.value) {
+		return;
+	}
+
+	const runId = activeThread.value;
+	const requestId = api.newId();
+	const model = selectedModel.value;
+	let answer = null;
+
+	running.value = { runId, requestId };
+	message.submitting = true;
+	message.formError = null;
+
+	try {
+		await api.stream({ reply, context: { run_id: runId, request_id: requestId, model } }, (event) => {
+			if (event.name === "form_submitted" || event.name === "form_cancelled") {
+				settleForms(reply.type === "form_submission" ? { values: reply.values } : { declined: true });
+				messages.value.push({
+					name: `${requestId}-a`,
+					role: "assistant",
+					content: "",
+					model,
+					streaming: true,
+					tools: [],
+				});
+				answer = messages.value[messages.value.length - 1];
+				scrollToBottom(true);
+			} else if (answer) {
+				follow(answer, event);
+			} else if (event.name === "outcome") {
+				handedBack(message, event.data);
+			}
+		});
+
+		if (answer) {
+			lost(answer);
+		}
+	} catch (error) {
+		if (answer) {
+			settle(answer, { type: "error", error: { type: "internal", detail: error.message } });
+		} else {
+			message.formError = error.message;
+		}
+	} finally {
+		message.submitting = false;
+		running.value = null;
+		refreshThreads();
+	}
+}
+
+// Applies one event of a running turn to the answer it is building.
+function follow(reply, event) {
+	if (event.name === "text_delta") {
+		reply.retrying = null;
+		reply.content += event.data.text;
+		scrollToBottom();
+	} else if (event.name === "tool_started") {
+		reply.tools.push({ ...event.data, status: "running" });
+		scrollToBottom();
+	} else if (event.name === "tool_ended") {
+		const call = reply.tools.find((tool) => tool.id === event.data.id);
+		if (call) {
+			call.status = event.data.failed ? "failed" : "done";
+		}
+	} else if (event.name === "retry_scheduled") {
+		reply.retrying = event.data.attempt + 1;
+	} else if (event.name === "outcome") {
+		settle(reply, event.data);
+	}
+}
+
+// A form that resumed nothing: handed back to fix, or no longer waiting.
+function handedBack(message, outcome) {
+	if (outcome.type === "form") {
+		message.form = outcome.form;
+		message.formError = outcome.form.error;
+	} else if (outcome.error?.type === "question_expired") {
+		settleForms({ expired: true });
+	} else {
+		message.formError = outcome.error?.detail || __("The answer could not be sent.");
+	}
+}
+
+// Marks the thread's waiting form as no longer waiting, with what became of it.
+function settleForms(response) {
+	for (const message of messages.value) {
+		if (message.status === "Paused") {
+			message.status = "Completed";
+			message.form_response = response;
+		}
+	}
+}
+
+// A stream that ended without saying how its turn ended.
+function lost(reply) {
+	if (reply.streaming) {
+		settle(reply, { type: "error", error: { type: "internal", detail: __("The connection was lost.") } });
+	}
+}
+
 function settle(reply, outcome) {
 	reply.streaming = false;
+	reply.retrying = null;
 
 	if (outcome.type === "text") {
 		reply.content = outcome.text;
 		reply.status = "Completed";
+		return;
+	}
+
+	if (outcome.type === "form") {
+		reply.status = "Paused";
+		reply.form = outcome.form;
+		scrollToBottom();
 		return;
 	}
 

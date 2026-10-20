@@ -18,7 +18,21 @@
 			></div>
 			<div v-else-if="message.streaming" class="thinking">
 				<span></span><span></span><span></span>
+				<em v-if="message.retrying" class="retrying text-muted">
+					{{ __("Retrying (attempt {0})…", [message.retrying]) }}
+				</em>
 			</div>
+
+			<FormCard
+				v-if="form"
+				:form="form"
+				:response="formResponse"
+				:error="message.formError || form.error || ''"
+				:submitting="Boolean(message.submitting)"
+				:busy="busy"
+				@submit="(values) => $emit('reply', { type: 'form_submission', form_id: form.id, values })"
+				@decline="$emit('reply', { type: 'form_cancellation', form_id: form.id })"
+			/>
 
 			<div v-if="message.status === 'Cancelled'" class="note text-muted">
 				{{ __("Stopped") }}
@@ -39,20 +53,31 @@
 <script setup>
 import { computed, ref } from "vue";
 import { renderMarkdown } from "../markdown";
+import FormCard from "./FormCard.vue";
 
 const props = defineProps({
 	message: { type: Object, required: true },
 	models: { type: Array, default: () => [] },
+	// An answer is running, so a waiting form cannot be sent yet.
+	busy: { type: Boolean, default: false },
 });
+
+defineEmits(["reply"]);
 
 const copied = ref(false);
 
 const html = computed(() => renderMarkdown(props.message.content));
 
-const error = computed(() => {
-	const value = props.message.error;
-	return (typeof value === "string" ? JSON.parse(value || "{}") : value) || {};
-});
+const error = computed(() => parsed(props.message.error) || {});
+
+// The question this answer paused on, and what became of it.
+const form = computed(() => parsed(props.message.form));
+const formResponse = computed(() => parsed(props.message.form_response));
+
+// A JSON field arrives as text when loaded, and as an object when streamed.
+function parsed(value) {
+	return (typeof value === "string" ? JSON.parse(value || "null") : value) || null;
+}
 
 const modelTitle = computed(
 	() => props.models.find((model) => model.id === props.message.model)?.title || props.message.model,
@@ -194,6 +219,7 @@ function copy() {
 }
 .thinking {
 	display: flex;
+	align-items: center;
 	gap: 4px;
 	padding: var(--padding-sm) 0;
 }
@@ -209,6 +235,10 @@ function copy() {
 }
 .thinking span:nth-child(3) {
 	animation-delay: 0.3s;
+}
+.retrying {
+	margin-left: var(--margin-sm);
+	font-size: var(--text-xs);
 }
 .note {
 	margin-top: var(--margin-xs);

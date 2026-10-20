@@ -39,7 +39,7 @@ export function listThreads() {
 export function listMessages(thread) {
 	return call("frappe.client.get_list", {
 		doctype: MESSAGE,
-		fields: ["name", "role", "content", "status", "model", "error"],
+		fields: ["name", "role", "content", "status", "model", "error", "form", "form_response"],
 		filters: { thread },
 		order_by: "creation asc",
 		limit_page_length: 0,
@@ -66,10 +66,13 @@ export function cancel(requestId) {
 /**
  * Runs one turn as a stream, handing each event to `onEvent` as it arrives.
  *
+ * `reply` answers or declines the form the run is waiting on, as a `form_submission`
+ * or a `form_cancellation`; `content` may then be left out.
+ *
  * Resolves once the stream ends. Rejects where the request is refused before it
  * starts, with the server's own message.
  */
-export async function stream({ content, context }, onEvent) {
+export async function stream({ content, context, reply }, onEvent) {
 	const response = await fetch(`/api/method/${AGENT}.stream`, {
 		method: "POST",
 		headers: {
@@ -77,7 +80,7 @@ export async function stream({ content, context }, onEvent) {
 			"Content-Type": "application/json",
 			"X-Frappe-CSRF-Token": frappe.csrf_token,
 		},
-		body: JSON.stringify({ content, context }),
+		body: JSON.stringify({ content, context, reply }),
 	});
 
 	if (!response.ok) {
