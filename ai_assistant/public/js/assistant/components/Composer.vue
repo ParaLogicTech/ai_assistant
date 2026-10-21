@@ -4,7 +4,7 @@
 			ref="input"
 			v-model="text"
 			rows="1"
-			:placeholder="__('Message the assistant')"
+			:placeholder="placeholder || __('Message the assistant')"
 			@input="resize"
 			@keydown.enter.exact.prevent="submit"
 		></textarea>
@@ -37,6 +37,7 @@ const props = defineProps({
 	streaming: { type: Boolean, default: false },
 	// Another thread's answer is running, so nothing new can be sent yet.
 	busy: { type: Boolean, default: false },
+	placeholder: { type: String, default: "" },
 });
 
 const emit = defineEmits(["send", "stop"]);

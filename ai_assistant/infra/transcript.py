@@ -11,6 +11,7 @@ __all__ = [
 	"open_thread",
 	"record_answer",
 	"record_question",
+	"resolve_form",
 ]
 
 THREAD = "AI Assistant Thread"
@@ -77,6 +78,10 @@ def record_answer(
 		_record(thread, context, role="assistant", content=outcome["text"])
 		return
 
+	if outcome is not None and outcome["type"] == "form":
+		_record(thread, context, role="assistant", content=partial, status="Paused", form=outcome["form"])
+		return
+
 	error = outcome["error"] if outcome is not None else None
 	cancelled = error is None or error["type"] == "cancelled"
 
@@ -98,6 +103,7 @@ def _record(
 	content: str,
 	status: str = "Completed",
 	error: dict[str, Any] | None = None,
+	form: dict[str, Any] | None = None,
 ) -> None:
 	frappe.get_doc(
 		{
@@ -107,12 +113,37 @@ def _record(
 			"content": content,
 			"status": status,
 			"error": error,
+			"form": form,
 			"model": context.model or DEFAULT_MODEL,
 			"request_id": context.request_id,
 		},
 	).insert()
 
 	# A stream's body runs after the request has committed, so each write commits itself.
+	frappe.db.commit()
+
+
+def resolve_form(thread: str, response: dict[str, Any]) -> None:
+	"""Saves what became of the form a thread was waiting on, so it reads as answered.
+
+	Args:
+		thread: The thread whose waiting form it was.
+		response: `{"values": ...}` for an answer, `{"declined": True, "reason": ...}`
+			for a refusal, `{"dismissed": True}` where the person moved on, or
+			`{"expired": True}` where the question no longer waited.
+	"""
+
+	# One form waits per run, so the thread's paused answer is the one it was.
+	for name in frappe.get_all(MESSAGE, filters={"thread": thread, "status": "Paused"}, pluck="name"):
+		frappe.db.set_value(
+			MESSAGE,
+			name,
+			{
+				"status": "Completed",
+				"form_response": frappe.as_json(response, indent=None),
+			},
+		)
+
 	frappe.db.commit()
 
 

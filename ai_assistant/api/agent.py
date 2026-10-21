@@ -12,16 +12,18 @@ from werkzeug.wrappers import Response
 
 from ai_assistant.agent import Agent
 from ai_assistant.capabilities.cancellation import Cancellation
+from ai_assistant.capabilities.error_handling import ErrorHandling
 from ai_assistant.capabilities.history import History
+from ai_assistant.capabilities.hitl import HITL
 from ai_assistant.capabilities.models import DEFAULT_MODEL, MODEL_REGISTRY, Models
 from ai_assistant.capabilities.tools import Tools
 from ai_assistant.config.llm import LLMSettings, llm_settings
-from ai_assistant.core import Context, Event, TextContent, content_of
+from ai_assistant.core import Context, Event, FormReply, FormSubmission, TextContent
 from ai_assistant.infra.conversation_store import FrappeConversationStore
 from ai_assistant.infra.key_value_store import FrappeCacheStore
 from ai_assistant.infra.litellm import LiteLLMModelFactory
 from ai_assistant.infra.tools import site_tools
-from ai_assistant.infra.transcript import open_thread, record_answer, record_question
+from ai_assistant.infra.transcript import THREAD, open_thread, record_answer, record_question, resolve_form
 
 # A turn's model call may run long; connecting should not.
 HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
@@ -34,47 +36,73 @@ Read the site's data with your tools rather than guessing, and say so when they 
 Describe a DocType before listing its documents if you do not know its fields. \
 If a tool says something is not permitted, tell the user rather than working around it.
 
+Asking the user:
+- Ask every question through the `request_input` tool, which shows the user a form. Never ask a \
+question in your reply text, and never end a reply waiting on an answer the user would have to type.
+- Ask when the request leaves out something only the user can decide: which record they mean, a \
+period, an amount, a choice between readings of what they said. Ask before anything you cannot undo.
+- Look first, then ask: read what you can with your tools, and offer what you found as a select's \
+`options` (the matching customers, the open orders) rather than listing them in your reply. Keep \
+options to the likeliest ten or so, and pre-fill `default` with your best guess.
+- Do not ask for what a tool can tell you, and do not ask when the request is already clear.
+
 Answer in Markdown, concisely, and lead with the answer."""
 
 _BLOCKS = TypeAdapter(list[TextContent])
+_REPLY = TypeAdapter(FormReply)
 _CONTEXT = TypeAdapter(Context)
 _CONTEXT_FIELDS = frozenset(field.name for field in fields(Context))
+
+# The events that end the form a run was waiting on.
+_FORM_ENDINGS = frozenset({"form_submitted", "form_cancelled", "form_dismissed"})
 
 
 @frappe.whitelist(methods=["POST"])
 def invoke(
-	content: str | list[dict[str, Any]],
+	content: str | list[dict[str, Any]] | None = None,
 	context: str | dict[str, Any] | None = None,
+	reply: str | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
 	"""Runs one turn of the thread `context.run_id` names, and returns how it ended.
 
+	Args:
+		content: What is said. May be left out beside a `reply`.
+		context: The turn's context.
+		reply: A `form_submission` or `form_cancellation` of the form the run waits on.
+
 	Returns:
-		dict: The outcome as a content block whose `type` says what it is.
+		dict: The outcome as a content block whose `type` says what it is: `text`,
+			`form` where the turn paused to ask, or `error`.
 	"""
 
-	said, turn = _parsed(content, context)
+	said, turn, answer = _parsed(content, context, reply)
 	settings = llm_settings()
-	thread = _opened(said, turn)
+	thread = _opened(said, turn, answer)
 
-	outcome = content_of(asyncio.run(_invoked(settings, said, turn))).model_dump(mode="json")
-	record_answer(thread, turn, outcome, partial="")
+	# Driven as a stream, so the waiting form is resolved on record as `stream` does.
+	outcome: dict[str, Any] = {}
+
+	for event in _recorded(_iterate(_streamed(settings, said, turn, answer)), thread, turn, answer):
+		if event.name == "outcome":
+			outcome = event.data
 
 	return outcome
 
 
 @frappe.whitelist(methods=["POST"])
 def stream(
-	content: str | list[dict[str, Any]],
+	content: str | list[dict[str, Any]] | None = None,
 	context: str | dict[str, Any] | None = None,
+	reply: str | dict[str, Any] | None = None,
 ) -> Response:
 	"""Runs one turn as server-sent events, ending on an `outcome` event holding what `invoke` returns."""
 
-	said, turn = _parsed(content, context)
+	said, turn, answer = _parsed(content, context, reply)
 	settings = llm_settings()
-	thread = _opened(said, turn)
+	thread = _opened(said, turn, answer)
 
 	return Response(
-		_sse(_recorded(_iterate(_streamed(settings, said, turn)), thread, turn)),
+		_sse(_recorded(_iterate(_streamed(settings, said, turn, answer)), thread, turn, answer)),
 		mimetype="text/event-stream",
 		headers={
 			"Cache-Control": "no-cache",
@@ -85,7 +113,9 @@ def stream(
 
 @frappe.whitelist(methods=["POST"])
 def cancel(request_id: str) -> None:
-	"""Asks a turn to stop. It lands at the turn's next step, or mid-answer while streaming."""
+	"""Asks a turn to stop. It lands at the turn's next step, mid-answer while streaming,
+	or during the wait before a retry.
+	"""
 
 	_check_user()
 
@@ -123,6 +153,8 @@ async def _agent(settings: LLMSettings) -> AsyncIterator[Agent]:
 			factory.get(DEFAULT_MODEL),
 			key_value_store=FrappeCacheStore(),
 			capabilities=[
+				ErrorHandling(),
+				HITL(FrappeCacheStore()),
 				Models(factory),
 				History(FrappeConversationStore()),
 				Tools(site_tools()),
@@ -135,18 +167,14 @@ async def _agent(settings: LLMSettings) -> AsyncIterator[Agent]:
 		)
 
 
-async def _invoked(settings: LLMSettings, said: str | list[TextContent], context: Context):
-	async with _agent(settings) as agent:
-		return await agent.ainvoke(said, context)
-
-
 async def _streamed(
 	settings: LLMSettings,
 	said: str | list[TextContent],
 	context: Context,
+	reply: FormReply | None,
 ) -> AsyncIterator[Event]:
 	async with _agent(settings) as agent:
-		async for event in agent.astream(said, context):
+		async for event in agent.astream(said, context, reply=reply):
 			yield event
 
 
@@ -171,29 +199,58 @@ def _iterate(events: AsyncIterator[Event]) -> Iterator[Event]:
 		loop.close()
 
 
-def _recorded(events: Iterator[Event], thread: str, context: Context) -> Iterator[Event]:
+def _recorded(
+	events: Iterator[Event],
+	thread: str,
+	context: Context,
+	reply: FormReply | None,
+) -> Iterator[Event]:
 	"""Passes a stream through, saving how its turn ended.
 
 	SAVED BEFORE THE OUTCOME IS SENT, so a client that reloads the thread on seeing it
 	finds the answer there. A client that goes away first still leaves what was
 	streamed to it on record, as a cancelled answer.
+
+	A REPLY THAT RESUMED NOTHING records no answer: a form handed back to fix is still
+	the one on record, and one that expired is marked so.
 	"""
 
 	partial: list[str] = []
+	# Whether this turn answers on record: a new message always does, a reply once it resumed.
+	answering = reply is None
 	recorded = False
 
 	try:
 		for event in events:
 			if event.name == "text_delta":
 				partial.append(event.data["text"])
+			elif event.name in _FORM_ENDINGS:
+				resolve_form(thread, _response(event, reply))
+				answering = True
 			elif event.name == "outcome":
-				record_answer(thread, context, event.data, "".join(partial))
+				if answering:
+					record_answer(thread, context, event.data, "".join(partial))
+				elif event.data["type"] == "error" and event.data["error"]["type"] == "question_expired":
+					resolve_form(thread, {"expired": True})
+
 				recorded = True
 
 			yield event
 	finally:
-		if not recorded:
+		if answering and not recorded:
 			record_answer(thread, context, None, "".join(partial))
+
+
+def _response(event: Event, reply: FormReply | None) -> dict[str, Any]:
+	"""What became of the waiting form, as it is kept on record."""
+
+	if event.name == "form_submitted" and isinstance(reply, FormSubmission):
+		return {"values": {name: reply.values.get(name) for name in event.data["fields"]}}
+
+	if event.name == "form_cancelled":
+		return {"declined": True, "reason": event.data.get("reason")}
+
+	return {"dismissed": True}
 
 
 def _sse(events: Iterator[Event]) -> Iterator[str]:
@@ -201,12 +258,21 @@ def _sse(events: Iterator[Event]) -> Iterator[str]:
 		yield f"event: {event.name}\ndata: {event.model_dump_json()}\n\n"
 
 
-def _opened(said: str | list[TextContent], context: Context) -> str:
-	"""Opens the turn's thread and saves its question, returning the thread's name."""
+def _opened(said: str | list[TextContent], context: Context, reply: FormReply | None) -> str:
+	"""Opens the turn's thread and saves its question, returning the thread's name.
+
+	A reply alone asks nothing new, so only what is said beside it is saved.
+	"""
 
 	question = said if isinstance(said, str) else "\n\n".join(block.text for block in said)
+
+	if reply is not None and not frappe.db.exists(THREAD, context.run_id):
+		frappe.throw(_("There is no conversation to answer in."), frappe.DoesNotExistError)
+
 	thread = open_thread(context, question)
-	record_question(thread, context, question)
+
+	if question:
+		record_question(thread, context, question)
 
 	return thread
 
@@ -219,12 +285,21 @@ def _check_user() -> None:
 
 
 def _parsed(
-	content: str | list[dict[str, Any]],
+	content: str | list[dict[str, Any]] | None,
 	context: str | dict[str, Any] | None,
-) -> tuple[str | list[TextContent], Context]:
-	"""What is said and the turn's context, validated before any model is built."""
+	reply: str | dict[str, Any] | None,
+) -> tuple[str | list[TextContent], Context, FormReply | None]:
+	"""What is said, the turn's context and any reply to a form, validated before any model is built."""
 
 	_check_user()
+
+	answer = None
+
+	if reply:
+		try:
+			answer = _REPLY.validate_python(frappe.parse_json(reply) if isinstance(reply, str) else reply)
+		except ValidationError as exc:
+			frappe.throw(_("Invalid reply: {0}").format(exc))
 
 	if isinstance(content, list):
 		try:
@@ -233,6 +308,9 @@ def _parsed(
 			frappe.throw(_("Invalid content: {0}").format(exc))
 	elif isinstance(content, str) and content.strip():
 		said = content
+	elif answer is not None:
+		# A reply needs nothing said beside it.
+		said = ""
 	else:
 		frappe.throw(_("content must be a non-empty string or a list of text blocks."))
 
@@ -249,4 +327,4 @@ def _parsed(
 	except ValidationError as exc:
 		frappe.throw(_("Invalid context: {0}").format(exc))
 
-	return said, turn
+	return said, turn, answer
