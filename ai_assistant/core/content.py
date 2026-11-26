@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
@@ -37,7 +37,7 @@ class Resource(BaseModel):
 		description="Unique id of the model instance.",
 	)
 	created_at: datetime = Field(
-		default_factory=lambda: datetime.now(timezone.utc),
+		default_factory=lambda: datetime.now(UTC),
 		description="UTC timestamp of when the model instance was created.",
 	)
 	metadata: dict[str, Any] = Field(
